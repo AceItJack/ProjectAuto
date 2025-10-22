@@ -165,6 +165,27 @@ def parse_time_flex(x) -> Optional[time]:
     except Exception:
         return np.nan
 
+# Added by Selena Johnson 22/10/2025
+
+
+def parse_time_flex_end(x) -> Optional[time]:
+    """
+    Parse the END part of a time range like '8:00 - 9:00' or '09:00–10:30'.
+    """
+    if pd.isna(x) or str(x).strip() == "":
+        return np.nan
+    s = str(x).strip()
+    if "-" in s:
+        parts = [p.strip() for p in s.split("-") if p.strip()]
+        if len(parts) > 1:
+            s = parts[-1]  # take right side for END
+        else:
+            s = parts[0]
+    try:
+        return pd.to_datetime(s).time()
+    except Exception:
+        return np.nan
+
 
 def _autofit_and_style(ws, df: pd.DataFrame, workbook):
     """Best-effort auto-width + header styles for xlsxwriter."""
@@ -339,7 +360,7 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
 
     schedule = pd.DataFrame()
 
-    # Adjusts time 15 minutes before and after events
+    # Adjusts time 15 minutes before events
 
     def adjust_time(t: time, delta_minutes: int) -> time:
         if pd.isna(t):
@@ -367,16 +388,27 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
 
     # Parse event start and end times
     event_start = df["Duty Start time"].apply(parse_time_flex)
-    event_end = df["Duty End time"].apply(parse_time_flex)
+    event_end = df["Duty End time"].apply(parse_time_flex_end)
 
-    # Map the colums
-    schedule["FSS CL Staff"] = ""  # assign later/manually
+    # Map the columns
+    # Add an empty column for staff assignment (filled manually later)
+    schedule["FSS CL Staff"] = ""
+
+    # Compute duty start: shift event start 15 minutes earlier
+    # event_start is a Series of parsed times (datetime.time or NaN)
     schedule["Duty Start Time"] = event_start.apply(
         lambda t: adjust_time(t, -15))
+
+    # Compute duty anticipated end: shift event END 15 minutes earlier
+    # This makes the duty finish before the event ends to allow teardown/setup
     schedule["Duty Anticipated End Time"] = event_end.apply(
-        lambda t: adjust_time(t, 15))
+        lambda t: adjust_time(t, -15))
+
+    # Store event start/end times (parsed) for display in the sheet
     schedule["Event Start Time"] = event_start
     schedule["Event End Time"] = event_end
+
+    # Activity/Title placeholders (left blank for now)
     schedule["Activity"] = ""  # placeholder
     schedule["Title"] = ""  # placeholder
     schedule["Full Name"] = df["Requester Name"]
@@ -621,6 +653,23 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+Before vs After (simple):
+
+Before:
+    - Duty start/end used inconsistent offsets. Duty anticipated end was being
+        computed as 15 minutes AFTER the event end in previous versions.
+    - Time parsing was duplicated around the mapping code.
+
+After (what I changed):
+    - Duty Start Time = event start minus 15 minutes.
+    - Duty Anticipated End Time = event end minus 15 minutes.
+    - Centralised time parsing into the helper and clarified the mapping with
+        short comments.
+
+If you'd like other offsets, edit the +/- minutes passed to `adjust_time`.
+"""
 '''
 if args.single_workbook:
     write_single_workbook(schedule, args.single_path)
