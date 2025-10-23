@@ -220,19 +220,12 @@ def _autofit_and_style(ws, df: pd.DataFrame, workbook):
             val = df.iat[r, c]
             if col == "Date":
                 try:
-                    if pd.notna(val):
-                        # ensure it's a date
-                        if isinstance(val, pd.Timestamp):
-                            ws.write_datetime(r + 1, c, val, date_fmt)
-                        else:
-                            ts = pd.to_datetime(val, errors="coerce")
-                            if pd.notna(ts):
-                                ws.write_datetime(r + 1, c, ts, date_fmt)
-                            else:
-                                ws.write(r + 1, c, "" if pd.isna(val)
-                                         else str(val), wrap_fmt)
+                    if pd.isna(val):
+                        ws.write(r + 1, c, "", date_fmt)
+                    elif isinstance(val, (pd.Timestamp, datetime)):
+                        ws.write_datetime(r + 1, c, val, date_fmt)
                     else:
-                        ws.write(r + 1, c, "", wrap_fmt)
+                        ws.write(r + 1, c, str(val), wrap_fmt)
                 except Exception:
                     ws.write(r + 1, c, "" if pd.isna(val)
                              else str(val), wrap_fmt)
@@ -290,11 +283,22 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
 
     # Dates
     start_date_col = col_get("Start Date:")
+    end_date_col = col_get("End Date:")
     if start_date_col:
-        out["Date"] = pd.to_datetime(data.get(start_date_col), errors="coerce")
+        # Normalized date (parsed) used for sorting/logic
+        out["Start Date"] = pd.to_datetime(
+            data.get(start_date_col), errors="coerce")
+        # Preserve the original input cell value for Start Date display
+        out["_input_date_raw"] = data.get(start_date_col)
     else:
-        out["Date"] = pd.NaT
-
+        out["Start Date"] = pd.NaT
+    if end_date_col:
+        out["End Date"] = pd.to_datetime(
+            data.get(end_date_col), errors="coerce")
+    else:
+        out["End Date"] = pd.NaT
+    # Keep "Date" for sorting/compatibility (same as start date)
+    out["Date"] = out["Start Date"]
     # Day text (infer from Date if missing)
     day_col = col_get("Day of Week:")
     if day_col and day_col in data.columns:
@@ -418,8 +422,13 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     schedule["Indicate Done(D), Not Needed(X)"] = ""
     schedule["List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)"] = df.apply(
         combine_equipment, axis=1)
-    schedule["Start Date"] = df["Date"].dt.strftime("%d-%b-%y")
-    schedule["End Date"] = df["Date"].dt.strftime("%d-%b-%y")
+    # Use the original input cell values for Start/End Date when available
+    # so the written workbook matches the input.xlsx formatting/values.
+    # Fall back to parsed 'Start Date' or 'Date' if raw input values are not present.
+    schedule["Start Date"] = df.get(
+        "_input_date_raw", df.get("Start Date", df.get("Date")))
+    schedule["End Date"] = df.get(
+        "_input_date_raw", df.get("End Date", df.get("Date")))
     schedule["Comments"] = ""
     return schedule
 
@@ -462,7 +471,7 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     })
 
     header_fmt = wb.add_format({
-        "bold": True, "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1, "italic": True, "font_size": 19,
+        "bold": True, "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1, "italic": True, "font_size": 12,
         "bg_color": "#E2EFDA"
     })
 
@@ -471,29 +480,24 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
         "border": 1, "italic": True, "font_size": 9, "bg_color": "#E2EFDA"
     })
 
-    cell_fmt = wb.add_format({
-        "valign": "top", "text_wrap": True, "border": 1
-    })
-    alt_fmt = wb.add_format({
-        "valign": "top", "text_wrap": True, "border": 1, "bg_color": "#F2F2F2"
-    })
-    time_fmt = wb.add_format({
-        "num_format": "hh:mm", "align": "center", "border": 1
-    })
-    date_fmt = wb.add_format({
-        "num_format": "dd-mmm-yy", "align": "center", "border": 1
-    })
+    cell_fmt = wb.add_format({"valign": "top", "text_wrap": True, "border": 1})
+    alt_fmt = wb.add_format(
+        {"valign": "top", "text_wrap": True, "border": 1, "bg_color": "#F2F2F2"})
+    time_fmt = wb.add_format(
+        {"num_format": "hh:mm", "align": "center", "border": 1})
+    date_fmt = wb.add_format(
+        {"num_format": "dd-mmm-yy", "align": "center", "border": 1})
 
     # TITLE ROW
-
     ws.merge_range(0, 0, 0, len(schedule.columns) - 1, sheet_name, title_fmt)
     ws.set_row(0, 25)
 
-    # === HEADER ROW ===
+    # HEADER ROW
     for c, col_name in enumerate(schedule.columns):
         ws.write(1, c, col_name, header_fmt)
-    ws.set_row(1, 35)  # header row height
+    ws.set_row(1, 35)
 
+    # Optional legend for 'Indicate' column
     indicate_col = None
     for i, col_name in enumerate(schedule.columns):
         if "Indicate" in col_name:
@@ -506,52 +510,50 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
             "• Task done by (initials)"
         )
         ws.write(2, indicate_col, legend_text, sub_header_fmt)
-        ws.set_row(2, 55)  # give height for the bullet list
+        ws.set_row(2, 55)
 
-    # === WRITE MAIN DATA (starting row 3 in Excel) ===
+    # WRITE MAIN DATA (starting row 3)
     start_row = 3
     for r in range(len(schedule)):
-        # Alternate row shading: every other block of 3-4 can be shaded
         fmt_row = alt_fmt if (r % 2 == 1) else cell_fmt
         for c, col in enumerate(schedule.columns):
             val = schedule.iat[r, c]
-            # time/date formatting
             if "Time" in col:
-                ws.write(r + start_row, c, str(val), time_fmt)
+                # write time values (if NaN, write blank)
+                ws.write(r + start_row, c, "" if pd.isna(val)
+                         else val, time_fmt)
             elif "Date" in col:
-                ws.write(r + start_row, c, val, date_fmt)
+                # write dates as dates
+                ws.write(r + start_row, c, pd.NaT if pd.isna(val)
+                         else val, date_fmt)
             else:
                 ws.write(r + start_row, c, "" if pd.isna(val)
                          else str(val), fmt_row)
 
-    # === COLUMN WIDTHS ===
+    # COLUMN WIDTHS
     widths = {
-        "FSS CL Staff": 19, "Duty Start Time": 12, "Duty Anticipated End Time": 25,
+        "FSS CL Staff": 14, "Duty Start Time": 12, "Duty Anticipated End Time": 18,
         "Event Start Time": 12, "Event End Time": 12,
-        "Activity": 10, "Title": 15, "Full Name": 20, "Event/Course": 22,
-        "Room:": 25, "NOTES": 35,
-        "Indicate: Done (D), Not Needed (X), If Not Done...": 30,
+        "Activity": 10, "Title": 10, "Full Name": 20, "Event/Course": 22,
+        "Room": 25, "NOTES": 35,
+        "Indicate Done(D), Not Needed(X)": 30,
         "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)": 32,
-        "Start Date:": 14, "End Date:": 14, "Comments": 28
+        "Start Date": 14, "End Date": 14, "Comments": 28
     }
-
     for i, col in enumerate(schedule.columns):
         ws.set_column(i, i, widths.get(col, 18))
 
-# ROW HEIGHTS
+    # ROW HEIGHTS
     for r in range(start_row, start_row + len(schedule)):
-        ws.set_row(r, 35)
+        ws.set_row(r, 30)
 
-# FREEZE the top rows
-
+    # Freeze header rows
     ws.freeze_panes(start_row, 0)
 
-# BORDERS
+    # Apply a thick border format to whole used area
     thick_border = wb.add_format({"border": 2})
-    ws.conditional_format(
-        0, 0, start_row + len(schedule), len(schedule.columns) - 1,
-        {"type": "no_errors", "format": thick_border}
-    )
+    ws.conditional_format(0, 0, start_row + len(schedule), len(schedule.columns) - 1,
+                          {"type": "no_errors", "format": thick_border})
 
 
 '''
@@ -662,7 +664,7 @@ Before:
         computed as 15 minutes AFTER the event end in previous versions.
     - Time parsing was duplicated around the mapping code.
 
-After (what I changed):
+After (what automated assistant changed):
     - Duty Start Time = event start minus 15 minutes.
     - Duty Anticipated End Time = event end minus 15 minutes.
     - Centralised time parsing into the helper and clarified the mapping with
