@@ -251,12 +251,117 @@ def combine_equipment(row):
             eq.append(col)
     return ", ".join(eq)
 
+# New function below
+
 
 def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -> pd.DataFrame:
     """
     - Detect header
     - Rename to canonical
-    - Parse dates/times
+    - Parse dates/times (while preserving original formats)
+    - Return normalized table with correct Start/End Dates
+    """
+    header_row = detect_header_row(raw_df, search_token=header_token)
+    data = raw_df.iloc[header_row + 1:].copy()
+    data.columns = raw_df.iloc[header_row].tolist()
+
+    # Clean up
+    data = data.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    data = data.map(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # Build fuzzy column map
+    col_map = build_column_map([c for c in data.columns if isinstance(c, str)])
+
+    def col_get(key: str) -> Optional[str]:
+        return col_map.get(key)
+
+    out = pd.DataFrame()
+
+    # Serial
+    out["Serial"] = data.get(col_get("Serial"), pd.Series(dtype="object"))
+
+    #  Capture Start & End Dates properly
+    start_date_col = col_get("Start Date:")
+    end_date_col = col_get("End Date:")
+
+    if start_date_col:
+        out["Start Date"] = pd.to_datetime(
+            data.get(start_date_col), errors="coerce")
+        out["_input_start_date_raw"] = data.get(start_date_col)
+    else:
+        out["Start Date"] = pd.NaT
+        out["_input_start_date_raw"] = pd.Series(dtype="object")
+
+    if end_date_col:
+        out["End Date"] = pd.to_datetime(
+            data.get(end_date_col), errors="coerce")
+        out["_input_end_date_raw"] = data.get(end_date_col)
+    else:
+        out["End Date"] = out["Start Date"]
+        out["_input_end_date_raw"] = data.get(start_date_col)
+
+    # Keep "Date" (for sorting)
+    out["Date"] = out["Start Date"]
+
+    # Day column
+    day_col = col_get("Day of Week:")
+    if day_col and day_col in data.columns:
+        out["Day"] = data[day_col].astype(str).map(_normalize_day_name)
+    else:
+        out["Day"] = [d.day_name() if pd.notna(d) else "" for d in out["Date"]]
+
+    # Times
+    start_time_col = col_get("Start Time:")
+    end_time_col = col_get("End Time:")
+    out["Duty Start time"] = data.get(
+        start_time_col, pd.Series(dtype="object"))
+    out["Duty End time"] = data.get(end_time_col, pd.Series(dtype="object"))
+    out["_sort_start_time"] = data.get(
+        start_time_col, pd.Series(dtype="object")).map(parse_time_flex)
+
+    # Basic mapping
+    mapping_pairs = [
+        ("Department/Unit", "Department/Unit:"),
+        ("Course/Event", "Course Code/Name of Event:"),
+        ("Room", "Room Assigned:"),
+        ("Support Request", "Support Request:"),
+        ("FSS Laptop", "FSS Laptop"),
+        ("Data Projector", "Data Projector"),
+        ("Speakers", "Speakers"),
+        ("Microphone (G102 only)", "Microphone (G102 only)"),
+        ("Requester Name", "Full Name:"),
+        ("Requester Phone", "Mobile Phone Number:"),
+    ]
+    for new_name, canon in mapping_pairs:
+        src = col_get(canon)
+        out[new_name] = data.get(src, pd.Series(dtype="object"))
+
+    # Maintain consistent structure
+    for col in OUTPUT_COLS:
+        if col not in out.columns:
+            out[col] = "" if col not in ("Date",) else pd.NaT
+
+    #  Include Start/End date columns in output order
+    out = out[
+        [c for c in OUTPUT_COLS]
+        + ["Start Date", "End Date", "_sort_start_time",
+            "_input_start_date_raw", "_input_end_date_raw"]
+    ]
+
+    #  Drop only empty rows safely
+    key_cols = [col for col in ["Start Date", "Day", "Duty Start time",
+                                "Department/Unit", "Course/Event", "Room"] if col in out.columns]
+    out = out[~out[key_cols].isna().all(axis=1)].copy()
+
+    return out
+
+
+'''
+def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -> pd.DataFrame:
+    """
+    - Detect header
+    - Rename to canonical
+    - Parse dates/times (while preserving original formats)
     - Add PU/SU
     - Return normalized table
     """
@@ -267,7 +372,8 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     # Drop fully-empty cols/rows and trim whitespace
     data = data.dropna(axis=1, how="all")
     data = data.dropna(axis=0, how="all")
-    data = data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    # Update to use map instead of deprecated applymap
+    data = data.map(lambda x: x.strip() if isinstance(x, str) else x)
 
     # Build fuzzy column map
     col_map = build_column_map([c for c in data.columns if isinstance(c, str)])
@@ -282,33 +388,7 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     out["Serial"] = data.get(col_get("Serial"), pd.Series(dtype="object"))
 
     # Dates
-    start_date_col = col_get("Start Date:")
-    end_date_col = col_get("End Date:")
-    if start_date_col:
-        # Normalized date (parsed) used for sorting/logic
-        out["Start Date"] = pd.to_datetime(
-            data.get(start_date_col), errors="coerce")
-        # Preserve the original input cell value for Start Date display
-        out["_input_date_raw"] = data.get(start_date_col)
-    else:
-        out["Start Date"] = pd.NaT
-    if end_date_col:
-        out["End Date"] = pd.to_datetime(
-            data.get(end_date_col), errors="coerce")
-    else:
-        out["End Date"] = pd.NaT
-    # Keep "Date" for sorting/compatibility (same as start date)
-    out["Date"] = out["Start Date"]
-    # Day text (infer from Date if missing)
-    day_col = col_get("Day of Week:")
-    if day_col and day_col in data.columns:
-        day_series = data[day_col].astype(str).map(_normalize_day_name)
-    else:
-        # If no day column, infer from Date
-        day_series = pd.Series(
-            [d.day_name() if pd.notna(d) else "" for d in out["Date"]], index=data.index
-        )
-    out["Day"] = day_series
+    
 
     # Times (keep original text & parse for sorting)
     start_time_col = col_get("Start Time:")
@@ -356,16 +436,71 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
 
     return out
 
+    '''
+
 # Added by Selena Johnson
+
+# New function below
 
 
 def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
-    # Transform normalized data into target schedule layout
+    schedule = pd.DataFrame()
 
+    def adjust_time(t: time, delta_minutes: int) -> time:
+        if pd.isna(t):
+            return np.nan
+        try:
+            if isinstance(t, str):
+                parsed = pd.to_datetime(t, errors="coerce").time()
+            elif isinstance(t, pd.Timestamp):
+                parsed = t.time()
+            elif isinstance(t, time):
+                parsed = t
+            else:
+                parsed = pd.to_datetime(t, errors="coerce").time()
+
+            return (datetime.combine(datetime.today(), parsed) +
+                    timedelta(minutes=delta_minutes)).time()
+        except Exception:
+            return np.nan
+
+    # Parse event times
+    event_start = df["Duty Start time"].apply(parse_time_flex)
+    event_end = df["Duty End time"].apply(parse_time_flex_end)
+
+    # Fill schedule columns
+    schedule["FSS CL Staff"] = ""
+    schedule["Duty Start Time"] = event_start.apply(
+        lambda t: adjust_time(t, -15))
+    schedule["Duty Anticipated End Time"] = event_end.apply(
+        lambda t: adjust_time(t, -15))
+    schedule["Event Start Time"] = event_start
+    schedule["Event End Time"] = event_end
+    schedule["Activity"] = ""
+    schedule["Title"] = ""
+    schedule["Full Name"] = df["Requester Name"]
+    schedule["Event/Course"] = df["Course/Event"]
+    schedule["Room Assigned"] = df["Room"]
+    schedule["NOTES"] = df["Support Request"]
+    schedule["Indicate Done(D), Not Needed(X)"] = ""
+    schedule["List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)"] = df.apply(
+        combine_equipment, axis=1)
+
+    # Preserve exact Start & End Date formatting from input
+    schedule["Start Date"] = df["_input_start_date_raw"]
+    schedule["End Date"] = df["_input_end_date_raw"]
+
+    schedule["Comments"] = ""
+    return schedule
+
+
+'''
+
+def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
+    # Transform normalized data into target schedule layout
     schedule = pd.DataFrame()
 
     # Adjusts time 15 minutes before events
-
     def adjust_time(t: time, delta_minutes: int) -> time:
         if pd.isna(t):
             return np.nan
@@ -373,7 +508,6 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
             # Parse time safely into a datetime.time
             if isinstance(t, str):  # string input
                 parsed = pd.to_datetime(t, errors="coerce").time()
-
             elif isinstance(t, pd.Timestamp):  # already datetime
                 parsed = t.time()
             elif isinstance(t, time):
@@ -422,18 +556,23 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     schedule["Indicate Done(D), Not Needed(X)"] = ""
     schedule["List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)"] = df.apply(
         combine_equipment, axis=1)
-    # Use the original input cell values for Start/End Date when available
-    # so the written workbook matches the input.xlsx formatting/values.
-    # Fall back to parsed 'Start Date' or 'Date' if raw input values are not present.
-    schedule["Start Date"] = df.get(
-        "_input_date_raw", df.get("Start Date", df.get("Date")))
-    schedule["End Date"] = df.get(
-        "_input_date_raw", df.get("End Date", df.get("Date")))
+
+    # Handle dates - use raw input values if available, otherwise use the parsed dates
+    if "_input_start_date_raw" in df.columns:
+        schedule["Start Date"] = df["_input_start_date_raw"]
+    else:
+        schedule["Start Date"] = df.get("Date", pd.Series(dtype="object"))
+
+    if "_input_end_date_raw" in df.columns:
+        schedule["End Date"] = df["_input_end_date_raw"]
+    else:
+        schedule["End Date"] = df.get("Date", pd.Series(dtype="object"))
+
     schedule["Comments"] = ""
     return schedule
 
 
-'''
+
 
     # Combine Course/Event + Requester time
     schedule["Activity Title / Full Name / Event-Course"] = (
@@ -460,15 +599,20 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
 
 def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     # Formatted duty schedule
-
     schedule = build_schedule_format(df)
     ws = xw.book.add_worksheet(sheet_name)
     wb = xw.book
 
-    # STYLES
+    # STYLES - preserving custom date format to match input.xlsx
     title_fmt = wb.add_format({
         "bold": True, "align": "center", "valign": "vcenter", "font_size": 16, "underline": True
     })
+
+    # Print the first few rows of schedule to debug
+    logging.debug("First few rows of schedule:")
+    for col in ['Start Date', 'End Date']:
+        if col in schedule.columns:
+            logging.debug(f"{col} values: {schedule[col].head()}")
 
     header_fmt = wb.add_format({
         "bold": True, "align": "center", "valign": "vcenter", "text_wrap": True, "border": 1, "italic": True, "font_size": 12,
@@ -523,9 +667,16 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
                 ws.write(r + start_row, c, "" if pd.isna(val)
                          else val, time_fmt)
             elif "Date" in col:
-                # write dates as dates
-                ws.write(r + start_row, c, pd.NaT if pd.isna(val)
-                         else val, date_fmt)
+                # For dates, preserve the exact input format if it's a string,
+                # otherwise use the standard date format
+                if pd.isna(val):
+                    ws.write(r + start_row, c, "", fmt_row)
+                elif isinstance(val, str):
+                    # Keep original string format
+                    ws.write(r + start_row, c, val, fmt_row)
+                else:
+                    # Use date formatting for datetime objects
+                    ws.write(r + start_row, c, val, date_fmt)
             else:
                 ws.write(r + start_row, c, "" if pd.isna(val)
                          else str(val), fmt_row)
