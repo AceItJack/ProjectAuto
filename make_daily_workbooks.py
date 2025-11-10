@@ -367,9 +367,8 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
         [c for c in OUTPUT_COLS]
         + extra_cols
         + ["Start Date", "End Date", "_sort_start_time",
-       "_input_start_date_raw", "_input_end_date_raw"]
-]
-
+           "_input_start_date_raw", "_input_end_date_raw"]
+    ]
 
     #  Drop only empty rows safely
     key_cols = [col for col in ["Start Date", "Day", "Duty Start time",
@@ -383,11 +382,17 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
 
 # New function below
 
-
 def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
-    schedule = pd.DataFrame()
+    """
+    Build the formatted duty schedule table from the normalized DataFrame.
+
+    Each Course/Event produces two rows:
+      - SU (Set Up): 15 min before event start → event start
+      - PU (Pick Up): 15 min before event end → 15 min after event end
+    """
 
     def adjust_time(t: time, delta_minutes: int) -> time:
+        """Shift a time value by delta_minutes safely."""
         if pd.isna(t):
             return np.nan
         try:
@@ -398,44 +403,95 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
             elif isinstance(t, time):
                 parsed = t
             else:
-                parsed = pd.to_datetime(t, errors="coerce").time()
-
+                parsed = pd.to_datetime(str(t), errors="coerce").time()
+            if pd.isna(parsed):
+                return np.nan
             return (datetime.combine(datetime.today(), parsed) +
                     timedelta(minutes=delta_minutes)).time()
         except Exception:
             return np.nan
 
-    # Parse event times
+    # Parse event start/end times
     event_start = df["Duty Start time"].apply(parse_time_flex)
     event_end = df["Duty End time"].apply(parse_time_flex_end)
 
-    # Fill schedule columns
-    schedule["FSS CL Staff"] = ""
-    schedule["Duty Start Time"] = event_start.apply(
-        lambda t: adjust_time(t, -15))
-    schedule["Duty Anticipated End Time"] = event_end.apply(
-        lambda t: adjust_time(t, -15))
-    schedule["Event Start Time"] = event_start
-    schedule["Event End Time"] = event_end
-    schedule["Activity"] = ""
-    schedule["Title"] = df.get("Title", "")
-    schedule["Full Name"] = df["Requester Name"]
-    schedule["Event/Course"] = df["Course/Event"]
-    schedule["Room Assigned"] = df["Room"]
-    schedule["NOTES"] = df["Support Request"]
-    schedule["Indicate Done(D), Not Needed(X)"] = ""
-    schedule["List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)"] = df.apply(
-        combine_equipment, axis=1)
+    # --- SU rows (Set Up) ---
+    setup_df = pd.DataFrame({
+        "Activity": "SU",
+        "Duty Start Time": event_start.apply(lambda t: adjust_time(t, -15)),
+        # Ends right when event starts
+        "Duty Anticipated End Time": event_start.apply(lambda t: adjust_time(t, 15)),
+        "Event Start Time": event_start,
+        "Event End Time": event_end,
+    })
 
-    # Preserve exact Start & End Date formatting from input
-    schedule["Start Date"] = df["_input_start_date_raw"]
-    schedule["End Date"] = df["_input_end_date_raw"]
+    # --- PU rows (Pick Up) ---
+    pickup_df = pd.DataFrame({
+        "Activity": "PU",
+        # 15 min before event ends
+        "Duty Start Time": event_end.apply(lambda t: adjust_time(t, -15)),
+        # 15 min after event ends
+        "Duty Anticipated End Time": event_end.apply(lambda t: adjust_time(t, 15)),
+        "Event Start Time": event_start,
+        "Event End Time": event_end,
+    })
 
-    schedule["Comments"] = ""
+    # --- Shared columns copied from input ---
+    shared_cols = {
+        "Title": df.get("Title", ""),
+        "Full Name": df.get("Requester Name", ""),
+        "Event/Course": df.get("Course/Event", ""),
+        "Room Assigned": df.get("Room", ""),
+        "NOTES": df.get("Support Request", ""),
+        "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)": df.apply(combine_equipment, axis=1),
+        "Start Date": df.get("_input_start_date_raw", df.get("Start Date", "")),
+        "End Date": df.get("_input_end_date_raw", df.get("End Date", "")),
+        "Comments": "",
+        "Indicate Done(D), Not Needed(X)": "",
+        "FSS CL Staff": ""
+    }
+
+    for col, values in shared_cols.items():
+        setup_df[col] = values
+        pickup_df[col] = values
+
+    # Combine both sets of rows (each event -> SU + PU)
+    schedule = pd.concat([setup_df, pickup_df], ignore_index=True)
+
+    # Desired column order
+    col_order = [
+        "FSS CL Staff",
+        "Duty Start Time",
+        "Duty Anticipated End Time",
+        "Event Start Time",
+        "Event End Time",
+        "Activity",
+        "Title",
+        "Full Name",
+        "Event/Course",
+        "Room Assigned",
+        "NOTES",
+        "Indicate Done(D), Not Needed(X)",
+        "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)",
+        "Start Date",
+        "End Date",
+        "Comments"
+    ]
+
+    # Ensure columns exist and ordered
+    for col in col_order:
+        if col not in schedule.columns:
+            schedule[col] = ""
+    schedule = schedule[col_order]
+
+    logging.debug(
+        f"Built schedule with {len(schedule)} rows (should be 2× input).")
+    logging.debug(f"Sample Activities: {schedule['Activity'].unique()}")
+
     return schedule
 
-
 # Added by Selena Johnson
+
 
 def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     """
@@ -449,38 +505,40 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     # --- STEP 1: Build formatted schedule from normalized data ---
     schedule = build_schedule_format(df)
 
-        # --- STEP 2: Ensure 'Title' column is preserved and visible ---
-    # Identify which column from the input has the Title data
+    # --- STEP 2: Ensure 'Title' column is preserved and visible ---
     title_source = None
     if "Title" in df.columns and df["Title"].notna().any():
         title_source = df["Title"]
     elif "Title:" in df.columns and df["Title:"].notna().any():
         title_source = df["Title:"]
 
-    # Debug log
     if title_source is not None:
-        logging.debug(f"Title source sample: {title_source.dropna().unique()[:5]}")
+        logging.debug(
+            f"Title source sample: {title_source.dropna().unique()[:5]}")
     else:
         logging.warning("No Title column found in source DataFrame.")
 
-    # Insert or replace Title column in the schedule
+    # --- Duplicate title values to match the SU/PU expansion ---
     if title_source is not None:
+        expanded_titles = np.repeat(
+            title_source.values, 2)  # Each event -> SU & PU
+        expanded_titles = pd.Series(expanded_titles, index=schedule.index)
+
         if "Title" not in schedule.columns:
             insert_pos = (
                 schedule.columns.get_loc("Full Name")
                 if "Full Name" in schedule.columns
                 else len(schedule.columns)
             )
-            schedule.insert(insert_pos, "Title", title_source.fillna(""))
+            schedule.insert(insert_pos, "Title", expanded_titles)
         else:
-            # Replace blanks or NaN with actual titles from source
+            # Replace empty or missing titles
             schedule["Title"] = np.where(
                 schedule["Title"].astype(str).str.strip() == "",
-                title_source.astype(str).fillna(""),
+                expanded_titles.astype(str).fillna(""),
                 schedule["Title"]
             )
     else:
-        # If no title column exists, still include one for layout
         if "Title" not in schedule.columns:
             insert_pos = (
                 schedule.columns.get_loc("Full Name")
@@ -543,7 +601,7 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
         ws.write(2, indicate_col, legend_text, sub_header_fmt)
         ws.set_row(2, 55)
 
-    # --- STEP 8: Write the main table body (starting from row 3) ---
+    # --- STEP 8: Write table body ---
     start_row = 3
     for r in range(len(schedule)):
         fmt_row = alt_fmt if (r % 2 == 1) else cell_fmt
@@ -585,14 +643,10 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     for i, col in enumerate(schedule.columns):
         ws.set_column(i, i, widths.get(col, 18))
 
-    # --- STEP 10: Row heights and layout tweaks ---
     for r in range(start_row, start_row + len(schedule)):
         ws.set_row(r, 30)
 
-    # Freeze header rows
     ws.freeze_panes(start_row, 0)
-
-    # --- STEP 11: Apply overall border style ---
     thick_border = wb.add_format({"border": 2})
     ws.conditional_format(
         0, 0,
@@ -1025,4 +1079,258 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     schedule["Comments"] = ""
 
     return schedule
+'''
+'''
+def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
+    schedule = pd.DataFrame()
+
+    def adjust_time(t: time, delta_minutes: int) -> time:
+        if pd.isna(t):
+            return np.nan
+        try:
+            if isinstance(t, str):
+                parsed = pd.to_datetime(t, errors="coerce").time()
+            elif isinstance(t, pd.Timestamp):
+                parsed = t.time()
+            elif isinstance(t, time):
+                parsed = t
+            else:
+                parsed = pd.to_datetime(t, errors="coerce").time()
+
+            return (datetime.combine(datetime.today(), parsed) +
+                    timedelta(minutes=delta_minutes)).time()
+        except Exception:
+            return np.nan
+
+    # Parse event times
+    event_start = df["Duty Start time"].apply(parse_time_flex)
+    event_end = df["Duty End time"].apply(parse_time_flex_end)
+
+    # Fill schedule columns
+    schedule["FSS CL Staff"] = ""
+    schedule["Duty Start Time"] = event_start.apply(
+        lambda t: adjust_time(t, -15))
+    schedule["Duty Anticipated End Time"] = event_end.apply(
+        lambda t: adjust_time(t, -15))
+    schedule["Event Start Time"] = event_start
+    schedule["Event End Time"] = event_end
+
+    # --- Derive Activity column (SU, PU, TS) ---
+    def derive_activity(row):
+        try:
+            start = row["Duty Start Time"]
+            end = row["Duty Anticipated End Time"]
+            event_start = row["Event Start Time"]
+            event_end = row["Event End Time"]
+
+            if pd.isna(start) or pd.isna(end) or pd.isna(event_start) or pd.isna(event_end):
+                return ""
+
+            # Convert to comparable datetimes
+            start_dt = datetime.combine(datetime.today(), start)
+            end_dt = datetime.combine(datetime.today(), end)
+            event_start_dt = datetime.combine(datetime.today(), event_start)
+            event_end_dt = datetime.combine(datetime.today(), event_end)
+
+            # Determine activity type:
+            if end_dt <= event_start_dt:
+                return "SU"  # Duty ends before event begins (setup)
+            elif start_dt >= event_end_dt:
+                return "PU"  # Duty starts after event ends (pickup)
+            else:
+                return "TS"  # Overlaps with event (technical support)
+        except Exception:
+            return ""
+
+
+
+            #There will always be a SU and PU for each request 
+            # Event start time and End time predominatly determines the SU or PU, ignore TS for now
+
+    schedule["Activity"] = schedule.apply(derive_activity, axis=1)
+
+    schedule["Title"] = df.get("Title", "")
+    schedule["Full Name"] = df["Requester Name"]
+    schedule["Event/Course"] = df["Course/Event"]
+    schedule["Room Assigned"] = df["Room"]
+    schedule["NOTES"] = df["Support Request"]
+    schedule["Indicate Done(D), Not Needed(X)"] = ""
+    schedule["List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)"] = df.apply(
+        combine_equipment, axis=1)
+
+    # Preserve exact Start & End Date formatting from input
+    schedule["Start Date"] = df["_input_start_date_raw"]
+    schedule["End Date"] = df["_input_end_date_raw"]
+
+    schedule["Comments"] = ""
+    return schedule
+'''
+
+'''
+
+def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
+    """
+    Create one worksheet (one day) in the output Excel file.
+
+    - Builds the formatted duty schedule for the given weekday.
+    - Preserves Title (Mr, Dr, Miss, etc.) from input.xlsx.
+    - Keeps Title as a column beside Full Name (not in the top sheet heading).
+    """
+
+    # --- STEP 1: Build formatted schedule from normalized data ---
+    schedule = build_schedule_format(df)
+
+    # --- STEP 2: Ensure 'Title' column is preserved and visible ---
+    # Identify which column from the input has the Title data
+    title_source = None
+    if "Title" in df.columns and df["Title"].notna().any():
+        title_source = df["Title"]
+    elif "Title:" in df.columns and df["Title:"].notna().any():
+        title_source = df["Title:"]
+
+    # Debug log
+    if title_source is not None:
+        logging.debug(
+            f"Title source sample: {title_source.dropna().unique()[:5]}")
+    else:
+        logging.warning("No Title column found in source DataFrame.")
+
+    # Insert or replace Title column in the schedule
+    if title_source is not None:
+        if "Title" not in schedule.columns:
+            insert_pos = (
+                schedule.columns.get_loc("Full Name")
+                if "Full Name" in schedule.columns
+                else len(schedule.columns)
+            )
+            schedule.insert(insert_pos, "Title", title_source.fillna(""))
+        else:
+            # Replace blanks or NaN with actual titles from source
+            schedule["Title"] = np.where(
+                schedule["Title"].astype(str).str.strip() == "",
+                title_source.astype(str).fillna(""),
+                schedule["Title"]
+            )
+    else:
+        # If no title column exists, still include one for layout
+        if "Title" not in schedule.columns:
+            insert_pos = (
+                schedule.columns.get_loc("Full Name")
+                if "Full Name" in schedule.columns
+                else len(schedule.columns)
+            )
+            schedule.insert(insert_pos, "Title", "")
+
+    # --- STEP 3: Create worksheet and define title for the top heading ---
+    ws = xw.book.add_worksheet(sheet_name)
+    wb = xw.book
+    display_title = f"Lecture Support - {sheet_name}"
+
+    # --- STEP 4: Define formatting styles ---
+    title_fmt = wb.add_format({
+        "bold": True, "align": "center", "valign": "vcenter",
+        "font_size": 16, "underline": True
+    })
+    header_fmt = wb.add_format({
+        "bold": True, "align": "center", "valign": "vcenter",
+        "text_wrap": True, "border": 1, "italic": True,
+        "font_size": 12, "bg_color": "#E2EFDA"
+    })
+    sub_header_fmt = wb.add_format({
+        "align": "left", "valign": "top", "text_wrap": True,
+        "border": 1, "italic": True, "font_size": 9, "bg_color": "#E2EFDA"
+    })
+    cell_fmt = wb.add_format({"valign": "top", "text_wrap": True, "border": 1})
+    alt_fmt = wb.add_format({
+        "valign": "top", "text_wrap": True, "border": 1,
+        "bg_color": "#F2F2F2"
+    })
+    time_fmt = wb.add_format(
+        {"num_format": "hh:mm", "align": "center", "border": 1})
+    date_fmt = wb.add_format(
+        {"num_format": "dd-mmm-yy", "align": "center", "border": 1})
+
+    # --- STEP 5: Write the top merged title row ---
+    ws.merge_range(0, 0, 0, len(schedule.columns) -
+                   1, display_title, title_fmt)
+    ws.set_row(0, 25)
+
+    # --- STEP 6: Write header row ---
+    for c, col_name in enumerate(schedule.columns):
+        ws.write(1, c, col_name, header_fmt)
+    ws.set_row(1, 35)
+
+    # --- STEP 7: Add legend under "Indicate Done(D), Not Needed(X)" column ---
+    indicate_col = None
+    for i, col_name in enumerate(schedule.columns):
+        if "Indicate" in col_name:
+            indicate_col = i
+            break
+    if indicate_col is not None:
+        legend_text = (
+            "Indicate:\n• Done (D)\n• Not Needed (X)\n"
+            "• If Not Done (leave blank until done)\n"
+            "• Task done by (initials)"
+        )
+        ws.write(2, indicate_col, legend_text, sub_header_fmt)
+        ws.set_row(2, 55)
+
+    # --- STEP 8: Write the main table body (starting from row 3) ---
+    start_row = 3
+    for r in range(len(schedule)):
+        fmt_row = alt_fmt if (r % 2 == 1) else cell_fmt
+        for c, col in enumerate(schedule.columns):
+            val = schedule.iat[r, c]
+            if "Time" in col:
+                ws.write(r + start_row, c, "" if pd.isna(val)
+                         else val, time_fmt)
+            elif "Date" in col:
+                if pd.isna(val):
+                    ws.write(r + start_row, c, "", fmt_row)
+                elif isinstance(val, str):
+                    ws.write(r + start_row, c, val, fmt_row)
+                else:
+                    ws.write(r + start_row, c, val, date_fmt)
+            else:
+                ws.write(r + start_row, c, "" if pd.isna(val)
+                         else str(val), fmt_row)
+
+    # --- STEP 9: Adjust column widths ---
+    widths = {
+        "FSS CL Staff": 14,
+        "Duty Start Time": 12,
+        "Duty Anticipated End Time": 18,
+        "Event Start Time": 12,
+        "Event End Time": 12,
+        "Activity": 10,
+        "Title": 10,
+        "Full Name": 20,
+        "Event/Course": 22,
+        "Room": 25,
+        "NOTES": 35,
+        "Indicate Done(D), Not Needed(X)": 30,
+        "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)": 32,
+        "Start Date": 14,
+        "End Date": 14,
+        "Comments": 28,
+    }
+    for i, col in enumerate(schedule.columns):
+        ws.set_column(i, i, widths.get(col, 18))
+
+    # --- STEP 10: Row heights and layout tweaks ---
+    for r in range(start_row, start_row + len(schedule)):
+        ws.set_row(r, 30)
+
+    # Freeze header rows
+    ws.freeze_panes(start_row, 0)
+
+    # --- STEP 11: Apply overall border style ---
+    thick_border = wb.add_format({"border": 2})
+    ws.conditional_format(
+        0, 0,
+        start_row + len(schedule),
+        len(schedule.columns) - 1,
+        {"type": "no_errors", "format": thick_border}
+    )
+
 '''
