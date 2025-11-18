@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Make daily Lecture Support workbooks from raw web-form export.
@@ -25,6 +26,72 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+import re
+
+
+def load_room_setup_requirements(path: str, sheet_name: str = 0) -> Dict[str, str]:
+    """
+    Read the Quick Check List Excel and return a mapping:
+        { normalized_room : equipment_needed_for_work }
+
+    The sheet structure (based on your uploaded file) is:
+      - Column 0: Room
+      - Column 1: Equipment within the Room
+      - Column 2: Equipment Needed for Work
+      - Column 3: Notes
+    """
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name)
+    except Exception as e:
+        logging.error("Failed to open room setup file '%s': %s", path, e)
+        return {}
+
+    # Rename columns explicitly for clarity
+    df = df.rename(columns={
+        df.columns[0]: "Room",
+        df.columns[1]: "EquipmentWithinRoom",
+        df.columns[2]: "EquipmentNeededForWork",
+        df.columns[3]: "Notes",
+    })
+
+    # Drop header row if it repeats the title line
+    if "Room" in str(df.iloc[0, 0]):
+        df = df.iloc[1:].reset_index(drop=True)
+
+    mapping: Dict[str, str] = {}
+
+    # Build dictionary: room -> Equipment Needed for Work
+    for _, row in df.iterrows():
+        room = _norm_room_key(row.get("Room"))
+        needed = str(row.get("EquipmentNeededForWork") or "").strip()
+        if room and needed and needed != "-":
+            mapping[room] = needed
+
+    return mapping
+
+
+def _norm_room_key(name: str) -> str:
+    if pd.isna(name) or not name:
+        return ""
+    s = str(name).upper().strip()
+
+    # Remove known building/floor prefixes
+    s = re.sub(r"\b(FSS_|FST_|FSTC_|FSB_|FSK_|FSS|FST)\b", "", s)
+
+    # Remove words like ROOM, SEMINAR, LAB, CLASSROOM, TR, GRAD, PSYC, CONFERENCE, THE
+    s = re.sub(
+        r"\b(ROOM|SEMINAR|LAB|CLASSROOM|TR|GRAD|PSYC|CONFERENCE|THE)\b", "", s)
+
+    # Remove punctuation and whitespace
+    s = re.sub(r"[^A-Z0-9]", "", s)
+
+    # Keep the last letter+number sequence (matches checklist like S6, F202, G202)
+    parts = re.findall(r"[A-Z]?\d+", s)
+    if parts:
+        return parts[-1]
+    return s
+
 
 # ---------- Config you can tweak ----------
 DAYS_ORDER = ["Monday", "Tuesday", "Wednesday",
@@ -241,39 +308,58 @@ def _normalize_day_name(s: str) -> str:
             return d
     return s
 
+
 # Added by Selena Johnson
 # Combine equipment columns into one string
+# combine equipment has been completely changed - 17/11/2025
+
+def combine_equipment(row, room_map: dict[str, str]) -> str:
+    """
+    Combine all equipment for a given event:
+      1. Event-specific equipment listed in the DataFrame
+      2. Room-specific equipment from room_map
+    Returns a comma-separated string of all equipment (no duplicates).
+    """
+    combined = []
+
+    # Event-specific equipment
+    event_eq = row.get("List Equipment Used", "")
+    if pd.notna(event_eq) and str(event_eq).strip() != "-":
+        combined.extend([x.strip() for x in str(event_eq).split(",") if x.strip()])
+
+    # Room-specific equipment
+    room_name = row.get("Room", "")
+    room_key = _norm_room_key(room_name)
+    room_eq = room_map.get(room_key, "")
+    room_eq_list = [x.strip() for x in str(room_eq).split(",") if x.strip()]
+
+    for eq in room_eq_list:
+        if eq not in combined:
+            combined.append(eq)
+
+    return ", ".join(combined)
 
 
-def combine_equipment(row):
-    eq = []
-    for col in ["FSS Laptop", "Data Projector", "Speakers", "Microphone (G102 only)"]:
-        if pd.notna(row.get(col)) and str(row[col]).strip():
-            eq.append(col)
-    return ", ".join(eq)
-
-# New function below
 
 
 def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -> pd.DataFrame:
     """
-    - Detect header
-    - Rename to canonical
-    - Parse dates/times (while preserving original formats)
-    - Return normalized table with correct Start/End Dates
+    Normalize raw schedule input:
+      - Detect header
+      - Rename columns to canonical names
+      - Parse dates/times
+      - Return normalized table with consistent Start/End Dates
     """
     header_row = detect_header_row(raw_df, search_token=header_token)
     data = raw_df.iloc[header_row + 1:].copy()
     data.columns = raw_df.iloc[header_row].tolist()
 
-    # Clean up
+    # Drop empty rows/columns
     data = data.dropna(axis=1, how="all").dropna(axis=0, how="all")
-    # data = data.map(lambda x: x.strip() if isinstance(x, str) else x)
-    data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    data = data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
     # Build fuzzy column map
     col_map = build_column_map([c for c in data.columns if isinstance(c, str)])
-    logging.debug("Column map found: %s", col_map)
 
     def col_get(key: str) -> Optional[str]:
         return col_map.get(key)
@@ -283,30 +369,27 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     # Serial
     out["Serial"] = data.get(col_get("Serial"), pd.Series(dtype="object"))
 
-    #  Capture Start & End Dates properly
+    # Start & End Dates
     start_date_col = col_get("Start Date:")
     end_date_col = col_get("End Date:")
 
     if start_date_col:
-        out["Start Date"] = pd.to_datetime(
-            data.get(start_date_col), errors="coerce")
+        out["Start Date"] = pd.to_datetime(data.get(start_date_col), errors="coerce")
         out["_input_start_date_raw"] = data.get(start_date_col)
     else:
         out["Start Date"] = pd.NaT
         out["_input_start_date_raw"] = pd.Series(dtype="object")
 
     if end_date_col:
-        out["End Date"] = pd.to_datetime(
-            data.get(end_date_col), errors="coerce")
+        out["End Date"] = pd.to_datetime(data.get(end_date_col), errors="coerce")
         out["_input_end_date_raw"] = data.get(end_date_col)
     else:
         out["End Date"] = out["Start Date"]
         out["_input_end_date_raw"] = data.get(start_date_col)
 
-    # Keep "Date" (for sorting)
     out["Date"] = out["Start Date"]
 
-    # Day column
+    # Day of Week
     day_col = col_get("Day of Week:")
     if day_col and day_col in data.columns:
         out["Day"] = data[day_col].astype(str).map(_normalize_day_name)
@@ -316,11 +399,9 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     # Times
     start_time_col = col_get("Start Time:")
     end_time_col = col_get("End Time:")
-    out["Duty Start time"] = data.get(
-        start_time_col, pd.Series(dtype="object"))
+    out["Duty Start time"] = data.get(start_time_col, pd.Series(dtype="object"))
     out["Duty End time"] = data.get(end_time_col, pd.Series(dtype="object"))
-    out["_sort_start_time"] = data.get(
-        start_time_col, pd.Series(dtype="object")).map(parse_time_flex)
+    out["_sort_start_time"] = data.get(start_time_col, pd.Series(dtype="object")).map(parse_time_flex)
 
     # Basic mapping
     mapping_pairs = [
@@ -336,43 +417,27 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
         ("Requester Phone", "Mobile Phone Number:"),
         ("Title", "Title"),
     ]
-    # for new_name, canon in mapping_pairs:
-    # src = col_get(canon)
-    # out[new_name] = data.get(src, pd.Series(dtype="object"))
+
     for new_name, canon in mapping_pairs:
         src = col_get(canon)
-        # --- 🔧 Fix for Title column ---
-        if new_name == "Title":
-            if src is None:
-                # Try to find any column that includes "title" in its name
-                title_col = next(
-                    (c for c in data.columns if "title" in str(c).lower()), None)
-                if title_col:
-                    src = title_col
-                    logging.debug(f"Found Title column manually: {src}")
+        if new_name == "Title" and src is None:
+            title_col = next((c for c in data.columns if "title" in str(c).lower()), None)
+            if title_col:
+                src = title_col
         out[new_name] = data.get(src, pd.Series(dtype="object"))
-    logging.debug("Detected Title values: %s", out['Title'].dropna().unique())
 
-    # Maintain consistent structure
+    # Ensure all output columns exist
     for col in OUTPUT_COLS:
         if col not in out.columns:
-            out[col] = "" if col not in ("Date",) else pd.NaT
+            out[col] = "" if col != "Date" else pd.NaT
 
-    #  Include Start/End date columns in output order
-    # Ensure Title is not dropped from final output
+    # Reorder columns
     extra_cols = ["Title"] if "Title" in out.columns else []
+    out = out[[c for c in OUTPUT_COLS] + extra_cols + ["Start Date", "End Date", "_sort_start_time",
+                                                      "_input_start_date_raw", "_input_end_date_raw"]]
 
-    # Include Start/End date columns in output order + Title
-    out = out[
-        [c for c in OUTPUT_COLS]
-        + extra_cols
-        + ["Start Date", "End Date", "_sort_start_time",
-           "_input_start_date_raw", "_input_end_date_raw"]
-    ]
-
-    #  Drop only empty rows safely
-    key_cols = [col for col in ["Start Date", "Day", "Duty Start time",
-                                "Department/Unit", "Course/Event", "Room"] if col in out.columns]
+    # Drop fully empty rows
+    key_cols = [c for c in ["Start Date", "Day", "Duty Start time", "Department/Unit", "Course/Event", "Room"] if c in out.columns]
     out = out[~out[key_cols].isna().all(axis=1)].copy()
 
     return out
@@ -382,9 +447,10 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
 
 # New function below
 
-def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
+def build_schedule_format(df: pd.DataFrame, room_map: dict) -> pd.DataFrame:
     """
     Build the formatted duty schedule table from the normalized DataFrame.
+    Appends room-mapped equipment to the inputted equipment list.
 
     Each Course/Event produces two rows:
       - SU (Set Up): 15 min before event start → event start
@@ -394,7 +460,7 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     def adjust_time(t: time, delta_minutes: int) -> time:
         """Shift a time value by delta_minutes safely."""
         if pd.isna(t):
-            return np.nan
+            return pd.NaT
         try:
             if isinstance(t, str):
                 parsed = pd.to_datetime(t, errors="coerce").time()
@@ -405,11 +471,11 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 parsed = pd.to_datetime(str(t), errors="coerce").time()
             if pd.isna(parsed):
-                return np.nan
+                return pd.NaT
             return (datetime.combine(datetime.today(), parsed) +
                     timedelta(minutes=delta_minutes)).time()
         except Exception:
-            return np.nan
+            return pd.NaT
 
     # Parse event start/end times
     event_start = df["Duty Start time"].apply(parse_time_flex)
@@ -419,7 +485,6 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     setup_df = pd.DataFrame({
         "Activity": "SU",
         "Duty Start Time": event_start.apply(lambda t: adjust_time(t, -15)),
-        # Ends right when event starts
         "Duty Anticipated End Time": event_start.apply(lambda t: adjust_time(t, 15)),
         "Event Start Time": event_start,
         "Event End Time": event_end,
@@ -428,9 +493,7 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     # --- PU rows (Pick Up) ---
     pickup_df = pd.DataFrame({
         "Activity": "PU",
-        # 15 min before event ends
         "Duty Start Time": event_end.apply(lambda t: adjust_time(t, -15)),
-        # 15 min after event ends
         "Duty Anticipated End Time": event_end.apply(lambda t: adjust_time(t, 15)),
         "Event Start Time": event_start,
         "Event End Time": event_end,
@@ -443,7 +506,7 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
         "Event/Course": df.get("Course/Event", ""),
         "Room Assigned": df.get("Room", ""),
         "NOTES": df.get("Support Request", ""),
-        "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)": df.apply(combine_equipment, axis=1),
+        "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)": df.apply(lambda r: combine_equipment(r, room_map), axis=1),
         "Start Date": df.get("_input_start_date_raw", df.get("Start Date", "")),
         "End Date": df.get("_input_end_date_raw", df.get("End Date", "")),
         "Comments": "",
@@ -478,17 +541,15 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
         "Comments"
     ]
 
-    # Ensure columns exist and ordered
+    # Ensure columns exist and are ordered
     for col in col_order:
         if col not in schedule.columns:
             schedule[col] = ""
     schedule = schedule[col_order]
 
-    logging.debug(
-        f"Built schedule with {len(schedule)} rows (should be 2× input).")
-    logging.debug(f"Sample Activities: {schedule['Activity'].unique()}")
-
+    
     return schedule
+
 
 # Added by Selena Johnson
 
@@ -503,7 +564,11 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     """
 
     # --- STEP 1: Build formatted schedule from normalized data ---
-    schedule = build_schedule_format(df)
+    # load room_map somewhere
+    room_map = load_room_setup_requirements(
+        "FSS IT Support Quick Check List - Rooms and Needs 20251111.xlsx")
+
+    schedule = build_schedule_format(df, room_map=room_map)
 
     # --- STEP 2: Ensure 'Title' column is preserved and visible ---
     title_source = None
@@ -653,6 +718,8 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
         start_row + len(schedule),
         len(schedule.columns) - 1,
         {"type": "no_errors", "format": thick_border}
+
+
     )
 
 
@@ -739,6 +806,63 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
+def main():
+    ap = argparse.ArgumentParser(
+        description="Create daily Lecture Support workbooks from raw export.")
+    ap.add_argument("input", help="Path to raw export .xlsx")
+    ap.add_argument("--outdir", default="out",
+                    help="Directory to write day workbooks")
+    ap.add_argument("--single-workbook", action="store_true",
+                    help="Also write a single workbook with 7 sheets")
+    ap.add_argument("--single-path", default="out/Lecture Support - Weekly.xlsx",
+                    help="Path for the single workbook if --single-workbook is set")
+    ap.add_argument("--header-token", default="serial",
+                    help="Token to detect header row (case-insensitive). Default: 'serial'")
+    ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                    help="Logging verbosity (default: INFO)")
+    ap.add_argument("--room-setup-file", default=None,
+                help="Path to the 'FSS IT Support Quick Check List - Rooms and Needs' Excel to append room setup needs into NOTES")
+    args = ap.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(levelname)s: %(message)s"
+    )
+
+    # Read input and prepare schedule
+    raw_df = _read_input_excel(args.input, header=None)
+    schedule = prepare_schedule_table(raw_df)
+
+    # Optional room setup mapping
+    room_setup_map = None
+    if args.room_setup_file:
+        room_setup_map = load_room_setup_requirements(args.room_setup_file)
+
+    # Write files
+    write_daily_files(schedule, args.outdir, room_setup_map=room_setup_map)
+    if args.single_workbook:
+        write_single_workbook(
+            schedule,
+            os.path.join(args.outdir, "Lecture Support - Weekly.xlsx"),
+            room_setup_map=room_setup_map
+        )
+
+
+
+    raw_df = _read_input_excel(args.input, header=None)
+    # schedule = prepare_schedule_table(
+    # raw_df, header_token=args.header_token)
+    schedule = prepare_schedule_table(raw_df)
+    
+
+    write_daily_files(schedule, args.outdir)
+    if args.single_workbook:
+        write_single_workbook(schedule, os.path.join(
+            args.outdir, "Lecture Support - Weekly.xlsx"))
+
+'''
 
 """
 Before vs After (simple):
@@ -1079,96 +1203,9 @@ def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
     schedule["Comments"] = ""
 
     return schedule
-'''
-'''
-def build_schedule_format(df: pd.DataFrame) -> pd.DataFrame:
-    schedule = pd.DataFrame()
-
-    def adjust_time(t: time, delta_minutes: int) -> time:
-        if pd.isna(t):
-            return np.nan
-        try:
-            if isinstance(t, str):
-                parsed = pd.to_datetime(t, errors="coerce").time()
-            elif isinstance(t, pd.Timestamp):
-                parsed = t.time()
-            elif isinstance(t, time):
-                parsed = t
-            else:
-                parsed = pd.to_datetime(t, errors="coerce").time()
-
-            return (datetime.combine(datetime.today(), parsed) +
-                    timedelta(minutes=delta_minutes)).time()
-        except Exception:
-            return np.nan
-
-    # Parse event times
-    event_start = df["Duty Start time"].apply(parse_time_flex)
-    event_end = df["Duty End time"].apply(parse_time_flex_end)
-
-    # Fill schedule columns
-    schedule["FSS CL Staff"] = ""
-    schedule["Duty Start Time"] = event_start.apply(
-        lambda t: adjust_time(t, -15))
-    schedule["Duty Anticipated End Time"] = event_end.apply(
-        lambda t: adjust_time(t, -15))
-    schedule["Event Start Time"] = event_start
-    schedule["Event End Time"] = event_end
-
-    # --- Derive Activity column (SU, PU, TS) ---
-    def derive_activity(row):
-        try:
-            start = row["Duty Start Time"]
-            end = row["Duty Anticipated End Time"]
-            event_start = row["Event Start Time"]
-            event_end = row["Event End Time"]
-
-            if pd.isna(start) or pd.isna(end) or pd.isna(event_start) or pd.isna(event_end):
-                return ""
-
-            # Convert to comparable datetimes
-            start_dt = datetime.combine(datetime.today(), start)
-            end_dt = datetime.combine(datetime.today(), end)
-            event_start_dt = datetime.combine(datetime.today(), event_start)
-            event_end_dt = datetime.combine(datetime.today(), event_end)
-
-            # Determine activity type:
-            if end_dt <= event_start_dt:
-                return "SU"  # Duty ends before event begins (setup)
-            elif start_dt >= event_end_dt:
-                return "PU"  # Duty starts after event ends (pickup)
-            else:
-                return "TS"  # Overlaps with event (technical support)
-        except Exception:
-            return ""
 
 
-
-            #There will always be a SU and PU for each request 
-            # Event start time and End time predominatly determines the SU or PU, ignore TS for now
-
-    schedule["Activity"] = schedule.apply(derive_activity, axis=1)
-
-    schedule["Title"] = df.get("Title", "")
-    schedule["Full Name"] = df["Requester Name"]
-    schedule["Event/Course"] = df["Course/Event"]
-    schedule["Room Assigned"] = df["Room"]
-    schedule["NOTES"] = df["Support Request"]
-    schedule["Indicate Done(D), Not Needed(X)"] = ""
-    schedule["List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)"] = df.apply(
-        combine_equipment, axis=1)
-
-    # Preserve exact Start & End Date formatting from input
-    schedule["Start Date"] = df["_input_start_date_raw"]
-    schedule["End Date"] = df["_input_end_date_raw"]
-
-    schedule["Comments"] = ""
-    return schedule
-'''
-
-'''
-
-def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
+def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str, room_setup_map: Optional[Dict[str, str]] = None):
     """
     Create one worksheet (one day) in the output Excel file.
 
@@ -1178,7 +1215,9 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
     """
 
     # --- STEP 1: Build formatted schedule from normalized data ---
-    schedule = build_schedule_format(df)
+    if room_setup_map is None:
+        room_setup_map = {}
+    schedule = build_schedule_format(df, room_setup_map)
 
     # --- STEP 2: Ensure 'Title' column is preserved and visible ---
     # Identify which column from the input has the Title data
@@ -1333,4 +1372,188 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
         {"type": "no_errors", "format": thick_border}
     )
 
+'''
+
+'''
+def combine_equipment(row, room_map):
+    """
+    Combine all equipment for a given event:
+      1. Event-specific equipment listed in the DataFrame
+      2. Room-specific equipment from room_map
+
+    Returns:
+        A comma-separated string of all equipment, no duplicates.
+    """
+    combined = []
+
+    # --- Step 1: Event-specific equipment ---
+    event_eq = row.get("List Equipment Used", "")
+    if pd.notna(event_eq) and str(event_eq).strip() != "-":
+        event_eq_list = [x.strip() for x in str(event_eq).split(",") if x.strip()]
+        combined.extend(event_eq_list)
+
+    # --- Step 2: Room-specific equipment ---
+    room_name = row.get("Room", "")
+    room_key = _norm_room_key(room_name)
+    room_eq = room_map.get(room_key, "")
+    room_eq_list = [x.strip() for x in str(room_eq).split(",") if x.strip()]
+
+    for eq in room_eq_list:
+        if eq not in combined:  # Avoid duplicates
+            combined.append(eq)
+
+    return ", ".join(combined)
+
+'''
+
+'''
+def combine_equipment(row):
+    eq = []
+    for col in ["FSS Laptop", "Data Projector", "Speakers", "Microphone (G102 only)"]:
+        if pd.notna(row.get(col)) and str(row[col]).strip():
+            eq.append(col)
+    return ", ".join(eq)
+'''
+# New function below
+
+
+'''
+
+
+
+def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -> pd.DataFrame:
+    """
+    - Detect header
+    - Rename to canonical
+    - Parse dates/times (while preserving original formats)
+    - Return normalized table with correct Start/End Dates
+    """
+    header_row = detect_header_row(raw_df, search_token=header_token)
+    data = raw_df.iloc[header_row + 1:].copy()
+    data.columns = raw_df.iloc[header_row].tolist()
+
+    # Clean up
+    data = data.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    # data = data.map(lambda x: x.strip() if isinstance(x, str) else x)
+    data.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # Build fuzzy column map
+    col_map = build_column_map([c for c in data.columns if isinstance(c, str)])
+    logging.debug("Column map found: %s", col_map)
+
+    def col_get(key: str) -> Optional[str]:
+        return col_map.get(key)
+
+    out = pd.DataFrame()
+
+    # Serial
+    out["Serial"] = data.get(col_get("Serial"), pd.Series(dtype="object"))
+
+    #  Capture Start & End Dates properly
+    start_date_col = col_get("Start Date:")
+    end_date_col = col_get("End Date:")
+
+    if start_date_col:
+        out["Start Date"] = pd.to_datetime(
+            data.get(start_date_col), errors="coerce")
+        out["_input_start_date_raw"] = data.get(start_date_col)
+    else:
+        out["Start Date"] = pd.NaT
+        out["_input_start_date_raw"] = pd.Series(dtype="object")
+
+    if end_date_col:
+        out["End Date"] = pd.to_datetime(
+            data.get(end_date_col), errors="coerce")
+        out["_input_end_date_raw"] = data.get(end_date_col)
+    else:
+        out["End Date"] = out["Start Date"]
+        out["_input_end_date_raw"] = data.get(start_date_col)
+
+    # Keep "Date" (for sorting)
+    out["Date"] = out["Start Date"]
+
+    # Day column
+    day_col = col_get("Day of Week:")
+    if day_col and day_col in data.columns:
+        out["Day"] = data[day_col].astype(str).map(_normalize_day_name)
+    else:
+        out["Day"] = [d.day_name() if pd.notna(d) else "" for d in out["Date"]]
+
+    # Times
+    start_time_col = col_get("Start Time:")
+    end_time_col = col_get("End Time:")
+    out["Duty Start time"] = data.get(
+        start_time_col, pd.Series(dtype="object"))
+    out["Duty End time"] = data.get(end_time_col, pd.Series(dtype="object"))
+    out["_sort_start_time"] = data.get(
+        start_time_col, pd.Series(dtype="object")).map(parse_time_flex)
+
+    # Basic mapping
+    mapping_pairs = [
+        ("Department/Unit", "Department/Unit:"),
+        ("Course/Event", "Course Code/Name of Event:"),
+        ("Room", "Room Assigned:"),
+        ("Support Request", "Support Request:"),
+        ("FSS Laptop", "FSS Laptop"),
+        ("Data Projector", "Data Projector"),
+        ("Speakers", "Speakers"),
+        ("Microphone (G102 only)", "Microphone (G102 only)"),
+        ("Requester Name", "Full Name:"),
+        ("Requester Phone", "Mobile Phone Number:"),
+        ("Title", "Title"),
+    ]
+    # for new_name, canon in mapping_pairs:
+    # src = col_get(canon)
+    # out[new_name] = data.get(src, pd.Series(dtype="object"))
+    for new_name, canon in mapping_pairs:
+        src = col_get(canon)
+        # --- 🔧 Fix for Title column ---
+        if new_name == "Title":
+            if src is None:
+                # Try to find any column that includes "title" in its name
+                title_col = next(
+                    (c for c in data.columns if "title" in str(c).lower()), None)
+                if title_col:
+                    src = title_col
+                    logging.debug(f"Found Title column manually: {src}")
+        out[new_name] = data.get(src, pd.Series(dtype="object"))
+    logging.debug("Detected Title values: %s", out['Title'].dropna().unique())
+
+    # Maintain consistent structure
+    for col in OUTPUT_COLS:
+        if col not in out.columns:
+            out[col] = "" if col not in ("Date",) else pd.NaT
+
+    #  Include Start/End date columns in output order
+    # Ensure Title is not dropped from final output
+    extra_cols = ["Title"] if "Title" in out.columns else []
+
+    # Include Start/End date columns in output order + Title
+    out = out[
+        [c for c in OUTPUT_COLS]
+        + extra_cols
+        + ["Start Date", "End Date", "_sort_start_time",
+           "_input_start_date_raw", "_input_end_date_raw"]
+    ]
+
+    #  Drop only empty rows safely
+    key_cols = [col for col in ["Start Date", "Day", "Duty Start time",
+                                "Department/Unit", "Course/Event", "Room"] if col in out.columns]
+    out = out[~out[key_cols].isna().all(axis=1)].copy()
+
+        #After mapping columns, create a temporary "List Equipment Used" column
+    equipment_cols = ["FSS Laptop", "Data Projector", "Speakers", "Microphone (G102 only)"]
+
+    # Only include columns that are not empty or '-'
+    out["List Equipment Used"] = out.apply(
+        lambda r: ", ".join(
+            [col for col in equipment_cols if pd.notna(r.get(col)) and str(r.get(col)).strip() not in ["", "-"]]
+        ),
+        axis=1
+)
+
+
+
+    #return out
+   
 '''
