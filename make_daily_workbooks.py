@@ -16,7 +16,7 @@ Notes:
 """
 
 # make_daily_workbooks.py
-
+from typing import Dict
 import argparse
 import os
 import sys
@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 
 import re
+
+ROOM_MAP_PATH = "FSS IT Support Quick Check List - Rooms and Needs 20251111.xlsx"
 
 
 def load_room_setup_requirements(path: str, sheet_name: str = 0) -> Dict[str, str]:
@@ -242,17 +244,24 @@ def parse_time_flex_end(x) -> Optional[time]:
     """
     if pd.isna(x) or str(x).strip() == "":
         return np.nan
+
     s = str(x).strip()
+
+    # Normalize dash types
+    s = s.replace("–", "-").replace("—", "-")
+
     if "-" in s:
         parts = [p.strip() for p in s.split("-") if p.strip()]
         if len(parts) > 1:
-            s = parts[-1]  # take right side for END
+            s = parts[-1]
         else:
             s = parts[0]
+
     try:
         return pd.to_datetime(s).time()
     except Exception:
         return np.nan
+
 
 
 def _autofit_and_style(ws, df: pd.DataFrame, workbook):
@@ -313,7 +322,8 @@ def _normalize_day_name(s: str) -> str:
 # Combine equipment columns into one string
 # combine equipment has been completely changed - 17/11/2025
 
-def combine_equipment(row, room_map: dict[str, str]) -> str:
+def combine_equipment(row, room_map: Dict[str, str]) -> str:
+
     """
     Combine all equipment for a given event:
       1. Event-specific equipment listed in the DataFrame
@@ -325,7 +335,8 @@ def combine_equipment(row, room_map: dict[str, str]) -> str:
     # Event-specific equipment
     event_eq = row.get("List Equipment Used", "")
     if pd.notna(event_eq) and str(event_eq).strip() != "-":
-        combined.extend([x.strip() for x in str(event_eq).split(",") if x.strip()])
+        combined.extend([x.strip()
+                        for x in str(event_eq).split(",") if x.strip()])
 
     # Room-specific equipment
     room_name = row.get("Room", "")
@@ -338,8 +349,6 @@ def combine_equipment(row, room_map: dict[str, str]) -> str:
             combined.append(eq)
 
     return ", ".join(combined)
-
-
 
 
 def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -> pd.DataFrame:
@@ -374,14 +383,16 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     end_date_col = col_get("End Date:")
 
     if start_date_col:
-        out["Start Date"] = pd.to_datetime(data.get(start_date_col), errors="coerce")
+        out["Start Date"] = pd.to_datetime(
+            data.get(start_date_col), errors="coerce")
         out["_input_start_date_raw"] = data.get(start_date_col)
     else:
         out["Start Date"] = pd.NaT
         out["_input_start_date_raw"] = pd.Series(dtype="object")
 
     if end_date_col:
-        out["End Date"] = pd.to_datetime(data.get(end_date_col), errors="coerce")
+        out["End Date"] = pd.to_datetime(
+            data.get(end_date_col), errors="coerce")
         out["_input_end_date_raw"] = data.get(end_date_col)
     else:
         out["End Date"] = out["Start Date"]
@@ -399,9 +410,11 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     # Times
     start_time_col = col_get("Start Time:")
     end_time_col = col_get("End Time:")
-    out["Duty Start time"] = data.get(start_time_col, pd.Series(dtype="object"))
+    out["Duty Start time"] = data.get(
+        start_time_col, pd.Series(dtype="object"))
     out["Duty End time"] = data.get(end_time_col, pd.Series(dtype="object"))
-    out["_sort_start_time"] = data.get(start_time_col, pd.Series(dtype="object")).map(parse_time_flex)
+    out["_sort_start_time"] = data.get(
+        start_time_col, pd.Series(dtype="object")).map(parse_time_flex)
 
     # Basic mapping
     mapping_pairs = [
@@ -421,7 +434,8 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     for new_name, canon in mapping_pairs:
         src = col_get(canon)
         if new_name == "Title" and src is None:
-            title_col = next((c for c in data.columns if "title" in str(c).lower()), None)
+            title_col = next(
+                (c for c in data.columns if "title" in str(c).lower()), None)
             if title_col:
                 src = title_col
         out[new_name] = data.get(src, pd.Series(dtype="object"))
@@ -434,10 +448,11 @@ def prepare_schedule_table(raw_df: pd.DataFrame, header_token: str = "serial") -
     # Reorder columns
     extra_cols = ["Title"] if "Title" in out.columns else []
     out = out[[c for c in OUTPUT_COLS] + extra_cols + ["Start Date", "End Date", "_sort_start_time",
-                                                      "_input_start_date_raw", "_input_end_date_raw"]]
+                                                       "_input_start_date_raw", "_input_end_date_raw"]]
 
     # Drop fully empty rows
-    key_cols = [c for c in ["Start Date", "Day", "Duty Start time", "Department/Unit", "Course/Event", "Room"] if c in out.columns]
+    key_cols = [c for c in ["Start Date", "Day", "Duty Start time",
+                            "Department/Unit", "Course/Event", "Room"] if c in out.columns]
     out = out[~out[key_cols].isna().all(axis=1)].copy()
 
     return out
@@ -547,14 +562,14 @@ def build_schedule_format(df: pd.DataFrame, room_map: dict) -> pd.DataFrame:
             schedule[col] = ""
     schedule = schedule[col_order]
 
-    
     return schedule
 
 
 # Added by Selena Johnson
 
 
-def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
+def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str, room_map: dict):
+
     """
     Create one worksheet (one day) in the output Excel file.
 
@@ -565,8 +580,7 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
 
     # --- STEP 1: Build formatted schedule from normalized data ---
     # load room_map somewhere
-    room_map = load_room_setup_requirements(
-        "FSS IT Support Quick Check List - Rooms and Needs 20251111.xlsx")
+    
 
     schedule = build_schedule_format(df, room_map=room_map)
 
@@ -697,7 +711,7 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
         "Title": 10,
         "Full Name": 20,
         "Event/Course": 22,
-        "Room": 25,
+        "Room Assigned": 25,
         "NOTES": 35,
         "Indicate Done(D), Not Needed(X)": 30,
         "List Equipment Used (Laptop, Projector, VGA, Speakers, etc.)": 32,
@@ -725,8 +739,8 @@ def _write_day_sheet(xw, df: pd.DataFrame, sheet_name: str):
 
 # Edited by Selena Johnson - put it back to original 15/10/2025
 
+def write_daily_files(df: pd.DataFrame, outdir: str, room_map: dict) -> List[str]:
 
-def write_daily_files(df: pd.DataFrame, outdir: str) -> List[str]:
     os.makedirs(outdir, exist_ok=True)
     written: List[str] = []
     day_series = df["Day"].astype(str).map(_normalize_day_name)
@@ -740,13 +754,13 @@ def write_daily_files(df: pd.DataFrame, outdir: str) -> List[str]:
         path = os.path.join(outdir, f"Lecture Support - {day}.xlsx")
         # Use xlsxwriter with formatting
         with pd.ExcelWriter(path, engine="xlsxwriter") as xw:
-            _write_day_sheet(xw, day_df, sheet_name=day)
+            _write_day_sheet(xw, day_df, sheet_name=day, room_map=room_map)
         written.append(path)
         logging.info("Wrote %s (%d rows)", path, len(day_df))
     return written
 
 
-def write_single_workbook(df: pd.DataFrame, out_path: str) -> None:
+def write_single_workbook(df: pd.DataFrame, out_path: str, room_map: dict) -> None:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as xw:
         day_series = df["Day"].astype(str).map(_normalize_day_name)
@@ -756,9 +770,15 @@ def write_single_workbook(df: pd.DataFrame, out_path: str) -> None:
                 day_df = day_df.sort_values(
                     by="_sort_start_time", kind="mergesort")
             else:
-                # Keep an empty sheet with headers
                 day_df = df.iloc[0:0].copy()
-            _write_day_sheet(xw, day_df, sheet_name=day)
+
+            _write_day_sheet(
+                xw,
+                day_df,
+                sheet_name=day,
+                room_map=room_map
+            )
+
 
 
 def _read_input_excel(path: str, header: Optional[int]) -> pd.DataFrame:
@@ -772,40 +792,90 @@ def _read_input_excel(path: str, header: Optional[int]) -> pd.DataFrame:
         sys.exit(2)
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description="Create daily Lecture Support workbooks from raw export.")
-    ap.add_argument("input", help="Path to raw export .xlsx")
-    ap.add_argument("--outdir", default="out",
-                    help="Directory to write day workbooks")
-    ap.add_argument("--single-workbook", action="store_true",
-                    help="Also write a single workbook with 7 sheets")
-    ap.add_argument("--single-path", default="out/Lecture Support - Weekly.xlsx",
-                    help="Path for the single workbook if --single-workbook is set")
-    ap.add_argument("--header-token", default="serial",
-                    help="Token to detect header row (case-insensitive). Default: 'serial'")
-    ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-                    help="Logging verbosity (default: INFO)")
-    args = ap.parse_args()
+# -------------------- Your existing imports --------------------
+# from your_module import _read_input_excel, prepare_schedule_table, load_room_setup_requirements, write_daily_files, write_single_workbook
+
+# -------------------- Main Function --------------------
+def main(input_path, outdir):
+    """
+    Generate daily and weekly Lecture Support workbooks.
+
+    Args:
+        input_path (str): Path to raw export Excel file.
+        outdir (str): Directory to write output workbooks.
+    """
+
+    # -------------------- Logging --------------------
+    logging.info("Input file: %s", input_path)
+    logging.info("Output directory: %s", outdir)
+
+    # -------------------- Read and prepare schedule --------------------
+    raw_df = _read_input_excel(input_path, header=None)
+    schedule = prepare_schedule_table(raw_df)
+
+    # -------------------- Room Map (embedded) --------------------
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller .exe
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(__file__)
+
+    room_map_path = os.path.join(
+        base_path,
+        "FSS IT Support Quick Check List - Rooms and Needs 20251111.xlsx"
+    )
+
+    room_map = load_room_setup_requirements(room_map_path)
+
+    if not room_map:
+        logging.warning(
+            "Room setup checklist loaded, but no room mappings were found. "
+            "Output will include event equipment only."
+        )
+
+    # -------------------- Write Workbooks --------------------
+    write_daily_files(schedule, outdir, room_map)
+
+    weekly_path = os.path.join(outdir, "Lecture Support - Weekly.xlsx")
+    write_single_workbook(schedule, weekly_path, room_map)
+    logging.info("Single weekly workbook written: %s", weekly_path)
+
+
+# -------------------- CLI Entry Point --------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Create daily and weekly Lecture Support workbooks from raw export."
+    )
+    parser.add_argument(
+        "--input", "-i",
+        required=True,
+        help="Path to raw export Excel (.xlsx) file"
+    )
+    parser.add_argument(
+        "--outdir", "-o",
+        default="out",
+        help="Directory to write output workbooks (default: 'out')"
+    )
+    parser.add_argument(
+        "--log-level", "-l",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging verbosity (default: INFO)"
+    )
+
+    args = parser.parse_args()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(levelname)s: %(message)s"
     )
-# Edited by Selena Johnson
-    raw_df = _read_input_excel(args.input, header=None)
-    # schedule = prepare_schedule_table(
-    # raw_df, header_token=args.header_token)
-    schedule = prepare_schedule_table(raw_df)
 
-    write_daily_files(schedule, args.outdir)
-    if args.single_workbook:
-        write_single_workbook(schedule, os.path.join(
-            args.outdir, "Lecture Support - Weekly.xlsx"))
+    print(f"Input file: {args.input}")
+    print(f"Room map (constant): FSS IT Support Quick Check List - Rooms and Needs 20251111.xlsx")
+    print(f"Output folder: {args.outdir}")
 
-
-if __name__ == "__main__":
-    main()
+    # Call main
+    main(args.input, args.outdir)
 
 '''
 def main():
